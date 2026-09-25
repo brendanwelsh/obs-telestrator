@@ -2,7 +2,7 @@
   <img src="assets/chum-logo.png" width="104" alt="chumthewaters" />
 </p>
 
-<h1 align="center">OBS Telestrator</h1>
+<h1 align="center">Telestrator</h1>
 
 <p align="center">
   <strong>Draw on your live output in <a href="https://obsproject.com">OBS Studio</a>,<br>
@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <img src="demo/demo.gif" width="720" alt="OBS Telestrator demo" />
+  <img src="demo/demo.gif" width="720" alt="Telestrator demo" />
 </p>
 
 ## What it is
