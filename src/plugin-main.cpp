@@ -34,6 +34,7 @@ milestone.
 #include <graphics/vec2.h>
 #include <graphics/vec4.h>
 #include <util/platform.h>
+#include <util/config-file.h>
 #include <plugin-support.h>
 
 #include "obs-websocket-api.h" // obs-websocket vendor API (header-only proc-handler shim)
@@ -1182,33 +1183,30 @@ void process_commands(TelSource *d)
 	if (f_clear.exchange(false))
 		do_clear(d);
 	if (f_colorswap.exchange(false)) {
-		g_color_index++;
-		if (g_color_index > COLOR_COUNT)
-			g_color_index = 1;
+		// Store once: the UI thread indexes g_color_array with this value.
+		int c = g_color_index.load();
+		g_color_index = (c >= COLOR_COUNT) ? 1 : c + 1;
 	}
 	if (f_sizetoggle.exchange(false)) {
-		if (g_size % 2 == 1)
-			g_size += 1;
-		else
-			g_size += 2;
-		if (g_size > BRUSH_MAX)
-			g_size = 2;
+		int sz = g_size.load();
+		sz += (sz % 2 == 1) ? 1 : 2;
+		g_size = (sz > BRUSH_MAX) ? 2 : sz;
 	}
 	if (f_toolcycle.exchange(false)) {
-		g_tool++;
-		if (g_tool > TOOL_COUNT)
-			g_tool = 1;
+		int t = g_tool.load();
+		g_tool = (t >= TOOL_COUNT) ? 1 : t + 1;
 	}
 	if (f_laser.exchange(false))
 		g_laser_mode = !g_laser_mode;
 	if (f_sizedown.exchange(false)) {
-		if (g_size % 2 == 1)
-			g_size -= 1;
-		else
-			g_size -= 2;
-		if (g_size < 2)
-			g_size = BRUSH_MAX;
+		int sz = g_size.load();
+		sz -= (sz % 2 == 1) ? 1 : 2;
+		g_size = (sz < 2) ? BRUSH_MAX : sz;
 	}
+	// An eraser mid-drag has already painted into the canvas; commit it first so
+	// the undo/redo rebuild and the stroke history agree.
+	if ((f_undo.load() || f_redo.load()) && g_active && g_active->eraser)
+		commit_stroke(d);
 	if (f_undo.exchange(false))
 		do_undo_now(d);
 	if (f_redo.exchange(false))
@@ -1334,9 +1332,13 @@ void handle_input(TelSource *d)
 	if (!GetCursorPos(&raw))
 		return;
 	HWND window = GetForegroundWindow();
+	// InternalGetWindowText reads the title without sending WM_GETTEXT, which
+	// would block this (graphics) thread on OBS's UI thread.
 	char window_name[512];
-	int wlen = window ? GetWindowTextA(window, window_name, sizeof(window_name)) : 0;
-	if (wlen <= 0)
+	wchar_t wname[512];
+	int wlen = window ? InternalGetWindowText(window, wname, 512) : 0;
+	if (wlen <= 0 ||
+	    WideCharToMultiByte(CP_ACP, 0, wname, wlen + 1, window_name, sizeof(window_name), nullptr, nullptr) <= 0)
 		window_name[0] = '\0';
 
 	if (window_match(window_name)) {
@@ -1472,9 +1474,11 @@ void tel_video_tick(void *data, float seconds)
 	// If the engine instance was destroyed, the next tick promotes this one and
 	// re-bakes the committed ink into its canvas.
 	bool rebake = false;
+	bool claimed = false;
 	if (!g_engine) {
 		g_engine = d;
 		rebake = true;
+		claimed = true;
 	}
 
 	struct obs_video_info ovi;
@@ -1484,8 +1488,13 @@ void tel_video_tick(void *data, float seconds)
 		if (d == g_engine) {
 			make_textures(d);
 			rebake = true; // fresh targets: repaint committed strokes below
+			claimed = false;
 		}
 	}
+	// A mirror only tracks the size; its textures may be from an older canvas
+	// resolution. Recreate them when it takes over as the engine.
+	if (claimed && d->canvas)
+		make_textures(d);
 	if (d != g_engine)
 		return; // mirror: size bookkeeping only; render uses the engine's textures
 
@@ -1517,6 +1526,8 @@ void tel_video_tick(void *data, float seconds)
 			g_dock_mx.store(pts[i0].x + (pts[i1].x - pts[i0].x) * u);
 			g_dock_my.store(pts[i0].y + (pts[i1].y - pts[i0].y) * u);
 			if (f >= 1.0f) {
+				// Feed the end point before releasing so the stroke isn't short.
+				feed_draw(d, g_dock_mx.load(), g_dock_my.load(), true);
 				g_dock_down.store(false);
 				g_sim_t = -1.0f;
 			}
@@ -1549,7 +1560,12 @@ void tel_video_tick(void *data, float seconds)
 			feed_draw(d, 0.0f, 0.0f, false);
 		}
 	} else {
-		g_active.reset();
+		// Commit rather than drop: an eraser has already painted into the
+		// canvas, so dropping it would let undo bring the erased ink back.
+		if (g_active)
+			commit_stroke(d);
+		g_sim_t = -1.0f;
+		g_dock_down.store(false);
 		d->has_mouse = false;
 	}
 
@@ -1835,6 +1851,12 @@ void do_replay_restart()
 // Frontend event: when our save finishes, load the clip + show the overlay.
 void tel_replay_event(enum obs_frontend_event event, void *)
 {
+	if (event == OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPING || event == OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPED ||
+	    event == OBS_FRONTEND_EVENT_EXIT) {
+		// Our save never landed; don't hijack the next unrelated replay save.
+		g_replay_pending = false;
+		return;
+	}
 	if (event != OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVED || !g_replay_pending)
 		return;
 	g_replay_pending = false;
@@ -2082,8 +2104,11 @@ static void ws_set_color(obs_data_t *req, obs_data_t *resp, void *)
 {
 	uint32_t rgb = (uint32_t)obs_data_get_int(req, "rgb");
 	if (obs_data_has_user_value(req, "r")) {
-		rgb = ((uint32_t)obs_data_get_int(req, "r") << 16) | ((uint32_t)obs_data_get_int(req, "g") << 8) |
-		      (uint32_t)obs_data_get_int(req, "b");
+		auto ch = [&](const char *k) -> uint32_t {
+			long long v = obs_data_get_int(req, k);
+			return (uint32_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+		};
+		rgb = (ch("r") << 16) | (ch("g") << 8) | ch("b");
 	}
 	uint8_t r = (rgb >> 16) & 0xFF, g = (rgb >> 8) & 0xFF, b = rgb & 0xFF;
 	set_custom_color(0xFF000000u | ((uint32_t)b << 16) | ((uint32_t)g << 8) | r); // engine stores ABGR
@@ -2308,6 +2333,7 @@ protected:
 	void hideEvent(QHideEvent *e) override
 	{
 		QWidget::hideEvent(e);
+		g_dock_down.store(false); // a hidden dock never sees the button release
 		// Closing/undocking can recreate the native HWND; drop the display so the
 		// next show rebinds it to the live window instead of the dead one.
 		destroyDisplay();
@@ -2339,6 +2365,7 @@ protected:
 	}
 	void contextMenuEvent(QContextMenuEvent *e) override
 	{
+		g_dock_down.store(false); // the menu grabs the mouse and eats the left release
 		QMenu menu(this);
 		QAction *fit = menu.addAction(obs_module_text("Menu.FitToWindow"));
 		QAction *fill = menu.addAction(obs_module_text("Menu.FillWindow"));
@@ -2866,11 +2893,36 @@ void place_docks_once()
 	obs_log(LOG_INFO, "telestrator: docks placed (one-time canonical layout)");
 }
 
+// OBS's Settings dialog saves frontend hotkeys to the profile's [Hotkeys]
+// section, but only reloads its own. Load ours from there so bindings survive a
+// restart and follow profile switches.
+std::vector<obs_hotkey_id> g_hotkey_ids; // parallel to g_hotkeys
+
+void load_hotkey_bindings()
+{
+	config_t *cfg = obs_frontend_get_profile_config();
+	if (!cfg)
+		return;
+	for (size_t i = 0; i < g_hotkey_ids.size(); i++) {
+		const char *json = config_get_string(cfg, "Hotkeys", g_hotkeys[i].name);
+		obs_data_t *data = (json && *json) ? obs_data_create_from_json(json) : nullptr;
+		obs_data_array_t *arr = data ? obs_data_get_array(data, "bindings") : nullptr;
+		obs_hotkey_load(g_hotkey_ids[i], arr); // null array clears a previous profile's bindings
+		obs_data_array_release(arr);
+		obs_data_release(data);
+	}
+}
+
 // Frontend event hook: assert the canonical dock layout once the frontend has
 // fully loaded (a beat later, so OBS's own dock restore has settled).
 void tel_frontend_event(enum obs_frontend_event event, void *)
 {
-	if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING) {
+	if (event == OBS_FRONTEND_EVENT_PROFILE_CHANGED) {
+		load_hotkey_bindings();
+	} else if (event == OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED) {
+		hide_replay_everywhere(); // a newly loaded collection may have saved the overlay visible
+	} else if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING) {
+		load_hotkey_bindings();
 		hide_replay_everywhere(); // never let a saved-visible replay overlay pollute the buffer
 		if (QMainWindow *mw = static_cast<QMainWindow *>(obs_frontend_get_main_window()))
 			QTimer::singleShot(600, mw, []() { place_docks_once(); });
@@ -2895,9 +2947,10 @@ bool obs_module_load(void)
 	telestrator_source_info.deactivate = tel_deactivate;
 	obs_register_source(&telestrator_source_info);
 
+	g_hotkey_ids.clear();
 	for (const auto &hk : g_hotkeys)
-		obs_hotkey_register_frontend(hk.name, obs_module_text(hk.label), tel_hotkey_cb,
-					     (void *)(intptr_t)hk.cmd);
+		g_hotkey_ids.push_back(obs_hotkey_register_frontend(hk.name, obs_module_text(hk.label), tel_hotkey_cb,
+								    (void *)(intptr_t)hk.cmd));
 
 	obs_log(LOG_INFO, "telestrator plugin loaded successfully (version %s)", PLUGIN_VERSION);
 	return true;
