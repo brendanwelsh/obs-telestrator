@@ -53,6 +53,6 @@ OBS_WS_PASSWORD=... node tools/drive.mjs
 
 ## License
 
-MIT. Keep the Herschel / Tari / katarai lineage attribution intact in `LICENSE`,
+MIT. Keep the mwelsh / Tari / katarai lineage attribution intact in `LICENSE`,
 the README, and source headers. This project exists because of the original
 obs-whiteboard.
