@@ -2,8 +2,7 @@
 Telestrator — a broadcast-style "draw on top of your stream" source for OBS Studio.
 
 Native C++/libobs port of the Lua engine (obs-telestrator-lua). Lineage:
-  * Original obs-whiteboard: Herschel.
-  * Second: Tari.
+  * Original obs-whiteboard: mwelsh.
   * Lua port (obs-whiteboard-lua): katarai.
   * Telestrator + this C++ port: brendanwelsh.
 MIT licensed — see LICENSE.
