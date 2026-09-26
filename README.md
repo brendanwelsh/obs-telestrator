@@ -141,7 +141,7 @@ path is pure Qt, so porting help is welcome.
 
 ## Lineage and attribution
 
-**obs-whiteboard** by [**mwelsh**](https://github.com/mwelsh) is the original.
+**[obs-whiteboard](https://github.com/Herschel/obs-whiteboard)** by [**Mike Welsh (Herschel)**](https://github.com/Herschel), with Tari, is the original.
 **katarai** ported it to Lua as
 [obs-whiteboard-lua](https://github.com/katarai/obs-whiteboard-lua). Brendan
 built the telestrator on that (obs-telestrator-lua), and this is the native
